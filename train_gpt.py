@@ -18,6 +18,9 @@ from pathlib import Path
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 
+if torch.cuda.is_available() and torch.cuda.get_device_capability() < (8, 9):
+    os.environ["DISABLE_FP8"] = "True"
+
 torch.empty(
     1, device="cuda", requires_grad=True
 ).backward()  # prevents a bug on some systems
@@ -49,7 +52,7 @@ def mm_op(
         out = torch._scaled_mm(
             x_f8,
             w_f8.T,
-            out_dtype=torch.bfloat16,
+            out_dtype=torch.float16,
             scale_a=x.new_tensor(x_s, dtype=torch.float32),
             scale_b=x.new_tensor(w_s, dtype=torch.float32),
             use_fast_accum=True,
@@ -82,7 +85,7 @@ def mm_backward_op(
         grad_x = torch._scaled_mm(
             grad_f8,
             w_f8.T.contiguous().T,
-            out_dtype=torch.bfloat16,
+            out_dtype=torch.float16,
             scale_a=grad_inv_s,
             scale_b=w_inv_s,
             use_fast_accum=False,
@@ -103,7 +106,7 @@ def mm_backward_op(
 
 @mm_backward_op.register_fake
 def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
-    return x_f8.to(torch.bfloat16), w_f8.T.contiguous().T.to(torch.float32)
+    return x_f8.to(torch.float16), w_f8.T.contiguous().T.to(torch.float32)
 
 
 def backward(ctx, grad_out: Tensor, *_):
@@ -416,7 +419,7 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
     Polar Express Sign Method: https://arxiv.org/pdf/2505.16932
     by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
     """
-    X = G.bfloat16()
+    X = G.half()
     if G.size(-2) > G.size(-1):
         X = X.mT
 
@@ -808,7 +811,7 @@ class DistAdam(torch.optim.Optimizer):
         for p in params:
             chunk_size = p.size(0) // self.world_size
             exp_avg = torch.zeros_like(
-                p[:chunk_size], dtype=torch.bfloat16, device=p[0].device
+                p[:chunk_size], dtype=torch.float16, device=p[0].device
             )
             exp_avg_sq = torch.zeros_like(exp_avg)
             self.state[p] = dict(step=0, exp_avg=exp_avg, exp_avg_sq=exp_avg_sq)
@@ -951,8 +954,8 @@ class Yarn(nn.Module):
         )
         t = torch.arange(self.max_seq_len, dtype=torch.float32, device=device)
         theta = torch.outer(t, angular_freq)
-        self.cos = nn.Buffer(theta.cos().to(torch.bfloat16), persistent=False)
-        self.sin = nn.Buffer(theta.sin().to(torch.bfloat16), persistent=False)
+        self.cos = nn.Buffer(theta.cos().to(torch.float16), persistent=False)
+        self.sin = nn.Buffer(theta.sin().to(torch.float16), persistent=False)
         self.angular_freq = angular_freq
         # start with 0.1, inspired by 0.12 from @leloykun and learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = 0.1
@@ -1589,8 +1592,12 @@ class Hyperparameters:
     val_tokens: int = 10485760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
     total_accum_steps: int = 8  # total micro-batches across all GPUs per update
-    sample_size = 32 # 2048
-    train_bs_schedule: tuple = (8 * sample_size * 8, 16 * sample_size * 8, 24 * sample_size * 8)
+    sample_size = 32  # 2048
+    train_bs_schedule: tuple = (
+        8 * sample_size * 8,
+        16 * sample_size * 8,
+        24 * sample_size * 8,
+    )
     train_bs_extension: int = 24 * sample_size * 8
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 24 * sample_size * 8  # reduced to avoid OOM with SDPA mask
@@ -1827,7 +1834,7 @@ model: nn.Module = GPT(
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
-        m.bfloat16()
+        m.half()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
