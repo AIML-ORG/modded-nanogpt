@@ -1623,6 +1623,10 @@ class Hyperparameters:
     ws_validate_post_yarn_ext: int = (
         20  # extend long windows out even further after applying YaRN
     )
+    # compilation
+    disable_compile: bool = False
+    compile_threads: int = 1
+    compile_mode: str = "reduce-overhead"
 
     def __post_init__(self):
         # Allow derived values to be updated if base values change
@@ -1756,6 +1760,23 @@ def get_args(defaults):
         help="extend long windows even further",
     )
 
+    # compilation
+    parser.add_argument(
+        "--disable_compile", action="store_true", help="disable torch.compile"
+    )
+    parser.add_argument(
+        "--compile_threads",
+        type=int,
+        default=defaults.compile_threads,
+        help="number of threads for torch.compile",
+    )
+    parser.add_argument(
+        "--compile_mode",
+        type=str,
+        default=defaults.compile_mode,
+        help="torch.compile mode: default, reduce-overhead, max-autotune",
+    )
+
     return parser.parse_args()
 
 
@@ -1766,6 +1787,13 @@ params = vars(parsed_args)
 params["train_bs_schedule"] = tuple(params["train_bs_schedule"])
 params["ws_schedule"] = tuple(params["ws_schedule"])
 args = Hyperparameters(**params)
+
+if args.disable_compile:
+    os.environ["TORCH_COMPILE_DISABLE"] = "1"
+else:
+    import torch._inductor.config as inductor_config
+
+    inductor_config.compile_threads = args.compile_threads
 
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
@@ -1953,7 +1981,8 @@ def step_optimizers(step: int, optimizers, model):
         optimizers[0].should_sync = False
 
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+if not args.disable_compile:
+    model: nn.Module = torch.compile(model, dynamic=False, mode=args.compile_mode)
 
 ########################################
 #            Warmup kernels            #
