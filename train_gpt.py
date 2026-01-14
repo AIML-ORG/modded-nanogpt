@@ -34,6 +34,11 @@ import triton.language as tl
 from torch import Tensor, nn
 
 dynamo.config.recompile_limit = 64
+import torch._inductor.config as inductor_config
+
+# Persistent caching for torch.compile in Kaggle output directory
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/kaggle/working/torch_compile_cache"
+inductor_config.fx_graph_cache = True
 
 
 # -----------------------------------------------------------------------------
@@ -2047,11 +2052,17 @@ for idx in range(len(ws_schedule)):
         send_args = (bs_schedule[idx], args.train_max_seq_len, grad_accum_steps)
     for step in range(warmup_steps):
         if step == 0:
-            print0(f"  Warmup training idx {idx}, ws_long {ws_long}...")
+            print0(
+                f"  Warmup training idx {idx}, ws_long {ws_long} (compiling or loading cache)..."
+            )
         inputs, targets, cum_seqlens = train_loader.send(send_args)
         if step % 2 == 1:
             optimizers[0].should_sync = True
         model(inputs, targets, cum_seqlens, ws_long // 2, ws_long).backward()
+        if step == 0:
+            print0(
+                f"  Warmup training step {step} finished (compilation complete/cache loaded)"
+            )
         if step % 2 == 0:
             optimizers[1].step()
             optimizers[1].zero_grad(set_to_none=True)
