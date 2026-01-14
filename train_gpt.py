@@ -14,8 +14,8 @@ from pathlib import Path
 
 # --- KAGGLE T4 COMPATIBILITY SETTINGS ---
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["DISABLE_FP8"] = "True"       # T4 does not support FP8
-os.environ["TORCH_COMPILE_DISABLE"] = "1" # T4 crashes with compile
+os.environ["DISABLE_FP8"] = "True"  # T4 does not support FP8
+os.environ["TORCH_COMPILE_DISABLE"] = "1"  # T4 crashes with compile
 # ----------------------------------------
 
 import torch
@@ -27,8 +27,11 @@ from torch import Tensor, nn
 try:
     from dion import Dion
 except ImportError:
-    print("Error: Dion not installed. Please run: pip install git+https://github.com/microsoft/dion.git")
+    print(
+        "Error: Dion not installed. Please run: pip install git+https://github.com/microsoft/dion.git"
+    )
     sys.exit(1)
+
 
 # -----------------------------------------------------------------------------
 # Distributed Data Parallel Helper for Standard Optimizers
@@ -36,13 +39,15 @@ except ImportError:
 # sync gradients for the Dion optimizer across GPUs.
 def sync_gradients(optimizer):
     for group in optimizer.param_groups:
-        for p in group['params']:
+        for p in group["params"]:
             if p.grad is not None:
                 # Average gradients across all GPUs
                 dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
+
 # -----------------------------------------------------------------------------
 # DistAdam (Kept original as it works fine on T4)
+
 
 class DistAdam(torch.optim.Optimizer):
     def __init__(
@@ -161,7 +166,7 @@ class CastedLinear(nn.Linear):
         self,
         in_features: int,
         out_features: int,
-        use_fp8=False, # Forced False via Env var logic below
+        use_fp8=False,  # Forced False via Env var logic below
         x_s=1.0,
         w_s=1.0,
         grad_s=1.0,
@@ -314,9 +319,7 @@ class CausalSelfAttention(nn.Module):
             self.attn_gate(x[..., : self.attn_gate.weight.size(-1)])
         ).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
-        y = F.linear(
-            y, sa_lambdas[1] * self.qkvo_w[self.dim * 3 :].type_as(y)
-        )
+        y = F.linear(y, sa_lambdas[1] * self.qkvo_w[self.dim * 3 :].type_as(y))
         return y
 
 
@@ -394,7 +397,7 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(
             model_dim,
             vocab_size,
-            use_fp8=False, # Disabled for T4
+            use_fp8=False,  # Disabled for T4
             x_s=(model_dim**0.5) / 448,
             w_s=2**-9,
             grad_s=1 / 448,
@@ -447,8 +450,17 @@ class GPT(nn.Module):
         short_bm = ws_short * args.block_size
         long_bm = ws_long * args.block_size
         bm_sizes = [
-            short_bm, short_bm, short_bm, long_bm, short_bm,
-            short_bm, None, short_bm, short_bm, short_bm, long_bm,
+            short_bm,
+            short_bm,
+            short_bm,
+            long_bm,
+            short_bm,
+            short_bm,
+            None,
+            short_bm,
+            short_bm,
+            short_bm,
+            long_bm,
         ]
         key_shift = [b == long_bm for b in bm_sizes]
 
@@ -513,7 +525,9 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens
     return tokens
 
+
 BOS_ID = 50256
+
 
 class BOSFinder:
     def __init__(self, tokens: Tensor, world_size: int = 1, quickload: bool = False):
@@ -522,14 +536,22 @@ class BOSFinder:
         self.quickload = quickload
         if quickload:
             self.bos_idx = (
-                (tokens[:4_000_000] == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+                (tokens[:4_000_000] == BOS_ID)
+                .nonzero(as_tuple=True)[0]
+                .to(torch.int64)
+                .cpu()
+                .numpy()
             )
             self.thread = None
             self.ready = threading.Event()
             self.start()
         else:
             self.bos_idx = (
-                (tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+                (tokens == BOS_ID)
+                .nonzero(as_tuple=True)[0]
+                .to(torch.int64)
+                .cpu()
+                .numpy()
             )
         self.i = 0
         self.world_size = world_size
@@ -537,7 +559,11 @@ class BOSFinder:
 
     def _load(self):
         self.bos_idx_async = (
-            (self.tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+            (self.tokens == BOS_ID)
+            .nonzero(as_tuple=True)[0]
+            .to(torch.int64)
+            .cpu()
+            .numpy()
         )
         self.ready.set()
 
@@ -579,6 +605,7 @@ class BOSFinder:
         self.batch_iter += 1
         return starts, ends
 
+
 class DataPreloader:
     def __init__(self, file_iter, world_size: int = 1):
         self.file_iter = file_iter
@@ -603,7 +630,14 @@ class DataPreloader:
             self.thread.join()
         return self.data
 
-def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
+
+def distributed_data_generator(
+    filename_pattern: str,
+    num_tokens: int,
+    max_seq_len: int,
+    grad_accum_steps: int = 1,
+    align_to_bos: bool = True,
+):
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     assert num_tokens % (world_size * grad_accum_steps) == 0
@@ -625,7 +659,10 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         if align_to_bos:
             try:
                 seq_starts, seq_ends = finder.next_batch(num_tokens_local, max_seq_len)
-                start_idxs, end_idxs = (torch.tensor(seq_starts[rank]), torch.tensor(seq_ends[rank]))
+                start_idxs, end_idxs = (
+                    torch.tensor(seq_starts[rank]),
+                    torch.tensor(seq_ends[rank]),
+                )
             except StopIteration:
                 tokens, finder = preloader.get()
                 preloader.start()
@@ -661,8 +698,10 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             num_tokens = new_num_tokens // new_grad_accum_steps
             max_seq_len = new_max_seq_len
 
+
 # -----------------------------------------------------------------------------
 # Main Execution
+
 
 @dataclass
 class Hyperparameters:
@@ -671,7 +710,11 @@ class Hyperparameters:
     val_tokens: int = 10485760
     total_accum_steps: int = 8
     sample_size = 32
-    train_bs_schedule: tuple = (8 * sample_size * 8, 16 * sample_size * 8, 24 * sample_size * 8)
+    train_bs_schedule: tuple = (
+        8 * sample_size * 8,
+        16 * sample_size * 8,
+        24 * sample_size * 8,
+    )
     train_bs_extension: int = 24 * sample_size * 8
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 24 * sample_size * 8
@@ -686,42 +729,75 @@ class Hyperparameters:
     ws_schedule: tuple = (3, 7, 11)
     ws_final: int = 13
     ws_validate_post_yarn_ext: int = 20
-    disable_compile: bool = True # Force disabled
+    disable_compile: bool = True  # Force disabled
     compile_threads: int = 4
-    compile_mode: str = "default" # Unused but kept
+    compile_mode: str = "default"  # Unused but kept
 
     def __post_init__(self):
-        self.num_iterations = self.num_scheduled_iterations + self.num_extension_iterations
+        self.num_iterations = (
+            self.num_scheduled_iterations + self.num_extension_iterations
+        )
         if self.total_accum_steps != 8:
             scale = self.total_accum_steps / 8
-            self.train_bs_schedule = tuple(int(x * scale) for x in self.train_bs_schedule)
+            self.train_bs_schedule = tuple(
+                int(x * scale) for x in self.train_bs_schedule
+            )
             self.train_bs_extension = int(self.train_bs_extension * scale)
             self.val_batch_size = int(self.val_batch_size * scale)
 
+
 def get_args(defaults):
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     parser.add_argument("--train_files", type=str, default=defaults.train_files)
     parser.add_argument("--val_files", type=str, default=defaults.val_files)
     parser.add_argument("--val_tokens", type=int, default=defaults.val_tokens)
-    parser.add_argument("--total_accum_steps", type=int, default=defaults.total_accum_steps)
-    parser.add_argument("--train_bs_schedule", type=int, nargs="+", default=list(defaults.train_bs_schedule))
-    parser.add_argument("--train_bs_extension", type=int, default=defaults.train_bs_extension)
-    parser.add_argument("--train_max_seq_len", type=int, default=defaults.train_max_seq_len)
+    parser.add_argument(
+        "--total_accum_steps", type=int, default=defaults.total_accum_steps
+    )
+    parser.add_argument(
+        "--train_bs_schedule",
+        type=int,
+        nargs="+",
+        default=list(defaults.train_bs_schedule),
+    )
+    parser.add_argument(
+        "--train_bs_extension", type=int, default=defaults.train_bs_extension
+    )
+    parser.add_argument(
+        "--train_max_seq_len", type=int, default=defaults.train_max_seq_len
+    )
     parser.add_argument("--val_batch_size", type=int, default=defaults.val_batch_size)
-    parser.add_argument("--num_scheduled_iterations", type=int, default=defaults.num_scheduled_iterations)
-    parser.add_argument("--num_extension_iterations", type=int, default=defaults.num_extension_iterations)
+    parser.add_argument(
+        "--num_scheduled_iterations",
+        type=int,
+        default=defaults.num_scheduled_iterations,
+    )
+    parser.add_argument(
+        "--num_extension_iterations",
+        type=int,
+        default=defaults.num_extension_iterations,
+    )
     parser.add_argument("--cooldown_frac", type=float, default=defaults.cooldown_frac)
     parser.add_argument("--run_id", type=str, default=defaults.run_id)
     parser.add_argument("--val_loss_every", type=int, default=defaults.val_loss_every)
     parser.add_argument("--save_checkpoint", action="store_true")
     parser.add_argument("--block_size", type=int, default=defaults.block_size)
-    parser.add_argument("--ws_schedule", type=int, nargs="+", default=list(defaults.ws_schedule))
+    parser.add_argument(
+        "--ws_schedule", type=int, nargs="+", default=list(defaults.ws_schedule)
+    )
     parser.add_argument("--ws_final", type=int, default=defaults.ws_final)
-    parser.add_argument("--ws_validate_post_yarn_ext", type=int, default=defaults.ws_validate_post_yarn_ext)
+    parser.add_argument(
+        "--ws_validate_post_yarn_ext",
+        type=int,
+        default=defaults.ws_validate_post_yarn_ext,
+    )
     parser.add_argument("--disable_compile", action="store_true")
     parser.add_argument("--compile_threads", type=int, default=defaults.compile_threads)
     parser.add_argument("--compile_mode", type=str, default=defaults.compile_mode)
     return parser.parse_args()
+
 
 hp_defaults = Hyperparameters()
 parsed_args = get_args(hp_defaults)
@@ -744,6 +820,7 @@ grad_accum_steps = args.total_accum_steps // world_size
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 from datetime import timedelta
+
 dist.init_process_group(backend="nccl", device_id=device, timeout=timedelta(minutes=30))
 dist.barrier()
 master_process = rank == 0
@@ -754,11 +831,14 @@ if master_process:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
 
+
 def print0(s, console=False):
     if master_process:
         with open(logfile, "a") as f:
-            if console: print(s)
+            if console:
+                print(s)
             print(s, file=f)
+
 
 print0(f"RANK: {rank}, WORLD_SIZE: {world_size}, DEVICE: {device}")
 print0(f"grad_accum_steps: {grad_accum_steps}")
@@ -781,7 +861,8 @@ for param in model.parameters():
 
 # OPTIMIZER SETUP
 hidden_matrix_params = [
-    p for n, p in model.blocks.named_parameters()
+    p
+    for n, p in model.blocks.named_parameters()
     if p.ndim >= 2 and "embed" not in n and "gate" not in n
 ]
 embed_params = [p for n, p in model.named_parameters() if "embed" in n]
@@ -791,44 +872,62 @@ gate_params = [p for n, p in model.named_parameters() if "gate" in n]
 
 optimizer1 = DistAdam(
     embed_params + scalar_params + head_params,
-    lr=0.008, betas=(0.65, 0.95), eps=1e-8, weight_decay=0.0,
+    lr=0.008,
+    betas=(0.65, 0.95),
+    eps=1e-8,
+    weight_decay=0.0,
 )
 # Replaced NorMuon with Dion
 optimizer2 = Dion(
     hidden_matrix_params + gate_params,
     lr=0.023,
     momentum=0.95,
-    weight_decay=0.02, # Adjusted for Dion
+    weight_decay=0.02,  # Adjusted for Dion
 )
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
+
 def get_lr(step: int):
-    if step > args.num_scheduled_iterations: return 0.1
+    if step > args.num_scheduled_iterations:
+        return 0.1
     lr_max = 1.0
     x = step / args.num_scheduled_iterations
-    if x > 2 / 3: lr_max = 1.93
-    elif x > 1 / 3: lr_max = 1.51
+    if x > 2 / 3:
+        lr_max = 1.93
+    elif x > 1 / 3:
+        lr_max = 1.51
     if x >= 1 - args.cooldown_frac:
         w = (1 - x) / args.cooldown_frac
         return lr_max * w + (1 - w) * 0.1
     return lr_max
 
+
 def get_ws(step: int):
-    if step >= args.num_scheduled_iterations: return args.ws_final // 2, args.ws_final
+    if step >= args.num_scheduled_iterations:
+        return args.ws_final // 2, args.ws_final
     x = step / args.num_scheduled_iterations
     ws_idx = int(len(args.ws_schedule) * x)
     return args.ws_schedule[ws_idx] // 2, args.ws_schedule[ws_idx]
 
+
 def get_bs(step: int):
-    if step >= args.num_scheduled_iterations: return args.train_bs_extension
+    if step >= args.num_scheduled_iterations:
+        return args.train_bs_extension
     x = step / args.num_scheduled_iterations
     bs_idx = int(len(args.train_bs_schedule) * x)
     return args.train_bs_schedule[bs_idx]
 
-def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
+
+def get_muon_momentum(
+    step: int,
+    muon_warmup_steps=300,
+    muon_cooldown_steps=50,
+    momentum_min=0.85,
+    momentum_max=0.95,
+):
     momentum_cd_start = args.num_iterations - muon_cooldown_steps
     if step < muon_warmup_steps:
         frac = step / muon_warmup_steps
@@ -839,6 +938,7 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
     else:
         momentum = momentum_max
     return momentum
+
 
 def step_optimizers(step: int, optimizers, model):
     for optimizer in optimizers:
@@ -865,15 +965,22 @@ def step_optimizers(step: int, optimizers, model):
         model.zero_grad(set_to_none=True)
         optimizers[0].should_sync = False
 
+
 # SKIP WARMUP FOR DION (Simpler logic for T4 stability)
 # Directly initializing Training
 step_batch_size = args.train_bs_schedule[0]
-print0(f"Initializing training loader (batch_size={step_batch_size}, seq_len={args.train_max_seq_len}, grad_accum={grad_accum_steps})...")
+print0(
+    f"Initializing training loader (batch_size={step_batch_size}, seq_len={args.train_max_seq_len}, grad_accum={grad_accum_steps})..."
+)
 train_loader = distributed_data_generator(
-    args.train_files, step_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps
+    args.train_files,
+    step_batch_size,
+    args.train_max_seq_len,
+    grad_accum_steps=grad_accum_steps,
 )
 
 import gc
+
 gc.collect()
 
 training_time_ms = 0
@@ -892,13 +999,18 @@ for step in range(train_steps + 1):
 
     # VALIDATION
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-        if last_step: ws_long = args.ws_validate_post_yarn_ext
+        if last_step:
+            ws_long = args.ws_validate_post_yarn_ext
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
         val_loader = distributed_data_generator(
-            args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False
+            args.val_files,
+            args.val_batch_size,
+            -1,
+            grad_accum_steps=grad_accum_steps,
+            align_to_bos=False,
         )
         val_loss = 0
         with torch.no_grad():
@@ -908,28 +1020,41 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms", console=True)
+        print0(
+            f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms",
+            console=True,
+        )
         model.train()
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-    if last_step: break
+    if last_step:
+        break
 
     # TRAINING
     new_step_batch_size = get_bs(step)
-    send_args = (new_step_batch_size, args.train_max_seq_len, grad_accum_steps) if new_step_batch_size != step_batch_size else None
+    send_args = (
+        (new_step_batch_size, args.train_max_seq_len, grad_accum_steps)
+        if new_step_batch_size != step_batch_size
+        else None
+    )
     step_batch_size = new_step_batch_size
 
     for idx in range(grad_accum_steps):
         if idx == grad_accum_steps - 1 and step % 2 == 1:
             optimizers[0].should_sync = True
         inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, ws_short, ws_long) / grad_accum_steps).backward()
+        (
+            model(inputs, targets, cum_seqlens, ws_short, ws_long) / grad_accum_steps
+        ).backward()
 
     step_optimizers(step, optimizers, model)
 
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     if (step + 1) % 10 == 0:
-        print0(f"step:{step + 1}/{train_steps} time:{approx_training_time_ms:.0f}ms", console=True)
+        print0(
+            f"step:{step + 1}/{train_steps} time:{approx_training_time_ms:.0f}ms",
+            console=True,
+        )
 
 dist.destroy_process_group()
