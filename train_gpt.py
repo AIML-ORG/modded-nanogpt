@@ -858,3 +858,78 @@ def step_optimizers(step: int, optimizers, model):
         optimizers[1].zero_grad(set_to_none=True)
     else:
         # Sync Dion
+        sync_gradients(optimizers[1])
+        # Sync DistAdam triggers via should_sync
+        for optimizer in optimizers:
+            optimizer.step()
+        model.zero_grad(set_to_none=True)
+        optimizers[0].should_sync = False
+
+# SKIP WARMUP FOR DION (Simpler logic for T4 stability)
+# Directly initializing Training
+step_batch_size = args.train_bs_schedule[0]
+print0(f"Initializing training loader (batch_size={step_batch_size}, seq_len={args.train_max_seq_len}, grad_accum={grad_accum_steps})...")
+train_loader = distributed_data_generator(
+    args.train_files, step_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps
+)
+
+import gc
+gc.collect()
+
+training_time_ms = 0
+torch.cuda.synchronize()
+t0 = time.perf_counter()
+train_steps = args.num_iterations
+print0(f"Starting training for {train_steps} iterations...")
+ws_short, ws_long = get_ws(0)
+
+for step in range(train_steps + 1):
+    last_step = step == train_steps
+    ws_short, new_ws_long = get_ws(step)
+    if new_ws_long != ws_long:
+        model.yarn.apply(ws_long, new_ws_long)
+        ws_long = new_ws_long
+
+    # VALIDATION
+    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        if last_step: ws_long = args.ws_validate_post_yarn_ext
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.perf_counter() - t0)
+        model.eval()
+        val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+        val_loader = distributed_data_generator(
+            args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False
+        )
+        val_loss = 0
+        with torch.no_grad():
+            for _ in range(val_steps):
+                inputs, targets, cum_seqlens = next(val_loader)
+                val_loss += model(inputs, targets, cum_seqlens, ws_short, ws_long)
+        val_loss /= val_steps
+        del val_loader
+        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms", console=True)
+        model.train()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+    if last_step: break
+
+    # TRAINING
+    new_step_batch_size = get_bs(step)
+    send_args = (new_step_batch_size, args.train_max_seq_len, grad_accum_steps) if new_step_batch_size != step_batch_size else None
+    step_batch_size = new_step_batch_size
+
+    for idx in range(grad_accum_steps):
+        if idx == grad_accum_steps - 1 and step % 2 == 1:
+            optimizers[0].should_sync = True
+        inputs, targets, cum_seqlens = train_loader.send(send_args)
+        (model(inputs, targets, cum_seqlens, ws_short, ws_long) / grad_accum_steps).backward()
+
+    step_optimizers(step, optimizers, model)
+
+    approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+    if (step + 1) % 10 == 0:
+        print0(f"step:{step + 1}/{train_steps} time:{approx_training_time_ms:.0f}ms", console=True)
+
+dist.destroy_process_group()
