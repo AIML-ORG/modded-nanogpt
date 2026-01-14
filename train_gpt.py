@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 
 with open(sys.argv[0]) as f:
     code = f.read()  # read the code of this file ASAP, for logging
@@ -1587,10 +1588,12 @@ class Hyperparameters:
     )
     val_tokens: int = 10485760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (8 * 2048 * 8, 16 * 2048 * 8, 24 * 2048 * 8)
-    train_bs_extension: int = 24 * 2048 * 8
+    total_accum_steps: int = 8  # total micro-batches across all GPUs per update
+    sample_size = 32 # 2048
+    train_bs_schedule: tuple = (8 * sample_size * 8, 16 * sample_size * 8, 24 * sample_size * 8)
+    train_bs_extension: int = 24 * sample_size * 8
     train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 16384 * 8  # reduced to avoid OOM with SDPA mask
+    val_batch_size: int = 24 * sample_size * 8  # reduced to avoid OOM with SDPA mask
     # optimization
     num_scheduled_iterations: int = (
         2070  # number of steps to complete lr and ws schedule
@@ -1614,8 +1617,148 @@ class Hyperparameters:
         20  # extend long windows out even further after applying YaRN
     )
 
+    def __post_init__(self):
+        # Allow derived values to be updated if base values change
+        self.num_iterations = (
+            self.num_scheduled_iterations + self.num_extension_iterations
+        )
+        # Scale batch sizes by total_accum_steps if they are still at default values
+        # This allows simply changing --total_accum_steps to scale everything
+        if self.total_accum_steps != 8:
+            scale = self.total_accum_steps / 8
+            self.train_bs_schedule = tuple(
+                int(x * scale) for x in self.train_bs_schedule
+            )
+            self.train_bs_extension = int(self.train_bs_extension * scale)
+            self.val_batch_size = int(self.val_batch_size * scale)
 
-args = Hyperparameters()
+
+def get_args(defaults):
+    parser = argparse.ArgumentParser(
+        description="Train GPT", formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    # data
+    parser.add_argument(
+        "--train_files",
+        type=str,
+        default=defaults.train_files,
+        help="input .bin to train on",
+    )
+    parser.add_argument(
+        "--val_files",
+        type=str,
+        default=defaults.val_files,
+        help="input .bin to eval validation loss on",
+    )
+    parser.add_argument(
+        "--val_tokens",
+        type=int,
+        default=defaults.val_tokens,
+        help="how many tokens of validation data?",
+    )
+
+    # batch sizes
+    parser.add_argument(
+        "--total_accum_steps",
+        type=int,
+        default=defaults.total_accum_steps,
+        help="total micro-batches across all GPUs per update",
+    )
+    parser.add_argument(
+        "--train_bs_schedule",
+        type=int,
+        nargs="+",
+        default=list(defaults.train_bs_schedule),
+        help="train batch size schedule",
+    )
+    parser.add_argument(
+        "--train_bs_extension",
+        type=int,
+        default=defaults.train_bs_extension,
+        help="final train batch size",
+    )
+    parser.add_argument(
+        "--train_max_seq_len",
+        type=int,
+        default=defaults.train_max_seq_len,
+        help="train max sequence length",
+    )
+    parser.add_argument(
+        "--val_batch_size",
+        type=int,
+        default=defaults.val_batch_size,
+        help="validation batch size",
+    )
+
+    # optimization
+    parser.add_argument(
+        "--num_scheduled_iterations",
+        type=int,
+        default=defaults.num_scheduled_iterations,
+        help="number of steps to complete lr and ws schedule",
+    )
+    parser.add_argument(
+        "--num_extension_iterations",
+        type=int,
+        default=defaults.num_extension_iterations,
+        help="number of steps to continue training at final lr and ws",
+    )
+    parser.add_argument(
+        "--cooldown_frac",
+        type=float,
+        default=defaults.cooldown_frac,
+        help="fraction of num_scheduled_iterations spent cooling down the learning rate",
+    )
+
+    # evaluation and logging
+    parser.add_argument(
+        "--run_id", type=str, default=defaults.run_id, help="unique run id"
+    )
+    parser.add_argument(
+        "--val_loss_every",
+        type=int,
+        default=defaults.val_loss_every,
+        help="every how many steps to evaluate val loss?",
+    )
+    parser.add_argument(
+        "--save_checkpoint", action="store_true", help="save checkpoint at the end"
+    )
+
+    # attention masking
+    parser.add_argument(
+        "--block_size",
+        type=int,
+        default=defaults.block_size,
+        help="block size for attention",
+    )
+    parser.add_argument(
+        "--ws_schedule",
+        type=int,
+        nargs="+",
+        default=list(defaults.ws_schedule),
+        help="window size schedule",
+    )
+    parser.add_argument(
+        "--ws_final", type=int, default=defaults.ws_final, help="final window size"
+    )
+    parser.add_argument(
+        "--ws_validate_post_yarn_ext",
+        type=int,
+        default=defaults.ws_validate_post_yarn_ext,
+        help="extend long windows even further",
+    )
+
+    return parser.parse_args()
+
+
+hp_defaults = Hyperparameters()
+parsed_args = get_args(hp_defaults)
+
+params = vars(parsed_args)
+params["train_bs_schedule"] = tuple(params["train_bs_schedule"])
+params["ws_schedule"] = tuple(params["ws_schedule"])
+args = Hyperparameters(**params)
 
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
@@ -1624,8 +1767,10 @@ args.val_files = os.path.join(data_path, args.val_files)
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert 8 % world_size == 0, "world_size must be a divisor of 8"
-grad_accum_steps = 8 // world_size
+assert args.total_accum_steps % world_size == 0, (
+    f"total_accum_steps ({args.total_accum_steps}) must be a divisor of world_size ({world_size})"
+)
+grad_accum_steps = args.total_accum_steps // world_size
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
