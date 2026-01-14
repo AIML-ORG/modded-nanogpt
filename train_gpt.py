@@ -850,7 +850,6 @@ class DistAdam(torch.optim.Optimizer):
             grad_slice,
         )
 
-    @torch.compile
     @torch.no_grad()
     def step(self):
         rank = dist.get_rank()
@@ -1630,7 +1629,7 @@ class Hyperparameters:
     )
     # compilation
     disable_compile: bool = False
-    compile_threads: int = 1
+    compile_threads: int = 4
     compile_mode: str = "reduce-overhead"
 
     def __post_init__(self):
@@ -1814,7 +1813,9 @@ grad_accum_steps = args.total_accum_steps // world_size
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
+from datetime import timedelta
+
+dist.init_process_group(backend="nccl", device_id=device, timeout=timedelta(minutes=30))
 dist.barrier()
 master_process = rank == 0  # this process will do logging, checkpointing etc.
 
