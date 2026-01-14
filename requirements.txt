@@ -4,3 +4,5 @@ torch
 huggingface-hub
 kernels
 setuptools
+datasets
+tiktoken
