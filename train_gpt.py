@@ -1830,6 +1830,10 @@ def print0(s, console=False):
             print(s, file=f)
 
 
+print0(f"RANK: {rank}, WORLD_SIZE: {world_size}, DEVICE: {device}")
+print0(f"grad_accum_steps: {grad_accum_steps}")
+
+
 # begin by printing this file (the Python code)
 print0(code)
 print0("=" * 100)
@@ -1866,7 +1870,11 @@ for m in model.modules():
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
+num_params = sum(p.numel() for p in model.parameters())
+print0(f"Model initialized with {num_params:,} parameters")
+
 # collect the parameters to optimize
+print0("Creating parameter groups for optimizers...")
 hidden_matrix_params = [
     p
     for n, p in model.blocks.named_parameters()
@@ -1876,6 +1884,9 @@ embed_params = [p for n, p in model.named_parameters() if "embed" in n]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 gate_params = [p for n, p in model.named_parameters() if "gate" in n]
+print0(
+    f"  Groups created: hidden_matrix({len(hidden_matrix_params)}), embed({len(embed_params)}), scalar({len(scalar_params)}), head(1), gate({len(gate_params)})"
+)
 
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
@@ -1899,6 +1910,10 @@ for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
+print0("Optimizers initialized:")
+print0(f"  DistAdam: lr=0.008, betas=(0.65, 0.95), weight_decay=0.0")
+print0(f"  NorMuon: lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2")
+
 
 # learning rate schedule: tied to batch size schedule, with cooldown at the end.
 def get_lr(step: int):
@@ -1906,11 +1921,18 @@ def get_lr(step: int):
         return 0.1
     lr_max = 1.0
     x = step / args.num_scheduled_iterations
-    if x > 1 / 3:
-        lr_max = 1.51  # (16/8)**0.6
     if x > 2 / 3:
         lr_max = 1.93  # (24/8)**0.6
+        if step == int(args.num_scheduled_iterations * 2 / 3) + 1:
+            print0(f"  Step {step}: LR milestone reached (2/3), lr_max updated to 1.93")
+    elif x > 1 / 3:
+        lr_max = 1.51  # (16/8)**0.6
+        if step == int(args.num_scheduled_iterations * 1 / 3) + 1:
+            print0(f"  Step {step}: LR milestone reached (1/3), lr_max updated to 1.51")
+
     if x >= 1 - args.cooldown_frac:
+        if step == int(args.num_scheduled_iterations * (1 - args.cooldown_frac)):
+            print0(f"  Step {step}: LR cooldown started")
         w = (1 - x) / args.cooldown_frac
         lr = lr_max * w + (1 - w) * 0.1
         return lr
@@ -1982,11 +2004,15 @@ def step_optimizers(step: int, optimizers, model):
 
 
 if not args.disable_compile:
+    print0(f"Compiling model with mode: {args.compile_mode}...")
     model: nn.Module = torch.compile(model, dynamic=False, mode=args.compile_mode)
+    print0("Model compilation triggered.")
 
 ########################################
 #            Warmup kernels            #
 ########################################
+
+print0("Warmup phase started...")
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 warmup_steps = 10
@@ -1994,6 +2020,9 @@ initial_state = dict(
     model=copy.deepcopy(model.state_dict()),
     optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers],
 )  # save the initial state
+print0(
+    f"Initializing warmup train loader (batch_size={args.train_bs_schedule[0]}, seq_len={args.train_max_seq_len}, grad_accum={grad_accum_steps})..."
+)
 train_loader = distributed_data_generator(
     args.train_files,
     args.train_bs_schedule[0],
@@ -2017,6 +2046,8 @@ for idx in range(len(ws_schedule)):
         ws_long = new_ws_long
         send_args = (bs_schedule[idx], args.train_max_seq_len, grad_accum_steps)
     for step in range(warmup_steps):
+        if step == 0:
+            print0(f"  Warmup training idx {idx}, ws_long {ws_long}...")
         inputs, targets, cum_seqlens = train_loader.send(send_args)
         if step % 2 == 1:
             optimizers[0].should_sync = True
@@ -2035,6 +2066,10 @@ optimizers[0].should_sync = False
 model.eval()
 
 # warm up validation too
+print0("  Warmup validation...")
+print0(
+    f"Initializing warmup val loader (batch_size={args.val_batch_size}, grad_accum={grad_accum_steps})..."
+)
 val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
 val_loader = distributed_data_generator(
     args.val_files,
@@ -2055,7 +2090,10 @@ with torch.no_grad():
             new_ws_long = ws_schedule[ws_idx]
             model.yarn.apply(ws_long, new_ws_long)
             ws_long = new_ws_long
+
         val_loss += model(inputs, targets, cum_seqlens, ws_long // 2, ws_long)
+
+print0("Warmup phase completed. Resetting state for final training run.")
 
 del val_loader, val_loss
 model.train()
@@ -2071,12 +2109,16 @@ del train_loader, initial_state
 ########################################
 
 step_batch_size = args.train_bs_schedule[0]
+print0(
+    f"Initializing training loader (batch_size={step_batch_size}, seq_len={args.train_max_seq_len}, grad_accum={grad_accum_steps})..."
+)
 train_loader = distributed_data_generator(
     args.train_files,
     step_batch_size,
     args.train_max_seq_len,
     grad_accum_steps=grad_accum_steps,
 )
+print0("Data generators initialized.")
 
 import gc
 
@@ -2088,11 +2130,17 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
+print0(f"Starting training for {train_steps} iterations...")
 ws_short, ws_long = get_ws(0)
 for step in range(train_steps + 1):
+    if step == 0:
+        print0(f"  Training start: step {step}, ws_short {ws_short}, ws_long {ws_long}")
     last_step = step == train_steps
     ws_short, new_ws_long = get_ws(step)
     if new_ws_long != ws_long:
+        print0(
+            f"  Step {step}: window size (long) updated from {ws_long} to {new_ws_long}"
+        )
         model.yarn.apply(ws_long, new_ws_long)
         ws_long = new_ws_long
 
@@ -2145,6 +2193,10 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     new_step_batch_size = get_bs(step)
+    if new_step_batch_size != step_batch_size:
+        print0(
+            f"  Step {step}: batch size changed from {step_batch_size} to {new_step_batch_size}"
+        )
     send_args = (
         (new_step_batch_size, args.train_max_seq_len, grad_accum_steps)
         if new_step_batch_size != step_batch_size
@@ -2164,10 +2216,14 @@ for step in range(train_steps + 1):
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(
-        f"step:{step + 1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / (step + 1):.2f}ms",
-        console=True,
-    )
+    current_lr = get_lr(step) * 0.008  # using DistAdam base LR as reference for log
+    current_momentum = get_muon_momentum(step)
+
+    msg = f"step:{step + 1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / (step + 1):.2f}ms"
+    if (step + 1) % 10 == 0:
+        msg += f" lr:{current_lr:.6f} muon_mom:{current_momentum:.4f}"
+
+    print0(msg, console=True)
 
 print0(
     f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
